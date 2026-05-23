@@ -1,0 +1,385 @@
+##########################################################################
+# BEVFormer Docker Image — Blackwell DC (B200, sm_100) 対応版 (v5)
+# rev: blackwell-runpod-v5 (2026-05-14)
+#
+# v4 (blackwell-base.v4, nvidia/cuda:12.8.0 素ベース) からの主要差分:
+#   - Base 変更: nvidia/cuda:12.8.0-devel-ubuntu22.04
+#               → runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+#     Why: 5/9 教訓 (RunPod base 必須) からの退行を解消。v4 は CMD 未明示で
+#          /bin/bash が default → Pod 上で container restart loop (Pod 4 stuck の root cause)
+#          v5 base は /start.sh (nginx + sleep infinity) を継承、Pod 互換性確保
+#   - Python: 3.10 → 3.11 (base 同梱)
+#     Risk: mmcv 1.7.2 / mmdet 2.28.2 / mmdet3d 0.17.1 の Python 3.11 動作は実機検証なし
+#     Mitigation: 各 stage を独立 RUN + 詳細 log で切り分けやすく
+#   - PyTorch: 2.7.0+cu128 (PyPI self-install) → 2.8.0.dev20250319+cu128 (base 同梱)
+#     verified: tag と内容一致 (Issue #114 trap 回避)、libtorch_cuda.so に sm_100 cubin 含有
+#   - Stage 3 (PyTorch self-install) を削除、代わりに base 同梱版の verify stage に置換
+#   - smoke check stage 強化: mmcv._ext から MultiScaleDeformableAttention シンボル存在確認
+#
+# 命名規則: image 名に "-runpod-" 含む (feedback_runpod_image_must_be_runpod_base)
+#
+# Build (ローカル, GPU 不要):
+#   cd ~/work/bevformer
+#   docker build --no-cache \
+#       -t nabe2030/bevformer:blackwell-runpod-v5 \
+#       -f src/Dockerfile.blackwell-runpod-v5 . 2>&1 | tee /tmp/v5_build.log
+#
+# 想定 build 時間: 30-60 min (mmcv sourcebuild が支配的、MAX_JOBS=8)
+#
+# Container disk: template 側で containerDiskInGb=60 に設定 (image ~16GB + work_dirs 余裕)
+##########################################################################
+
+FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+
+LABEL maintainer="BEVFormer B200 build"
+LABEL description="BEVFormer for B200 (sm_100), RunPod base + Python 3.11 + PyTorch 2.8.0.dev+cu128"
+LABEL version="blackwell-runpod-v5"
+
+# ============================================================
+# 環境変数
+# Note: CMD / ENTRYPOINT は明示しない → base の /start.sh (nginx + sleep infinity) を継承
+# ============================================================
+ENV DEBIAN_FRONTEND=noninteractive
+# Hopper (H100/H200, sm_90) + Blackwell DC (B200, sm_100) 両対応
+ENV TORCH_CUDA_ARCH_LIST="9.0;10.0"
+ENV FORCE_CUDA=1
+ENV MMCV_WITH_OPS=1
+# MAX_JOBS=8: u58-slurm の CPU リソースに合わせ v4 の 4 から引き上げ (mmcv sourcebuild 高速化)
+ENV MAX_JOBS=8
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=/usr/local/cuda/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+
+# ============================================================
+# Stage 0: base image verify (Issue #114 trap detection + sm_100 cubin 確認)
+# Why: tag (2.8.0) と内容が一致していることを build 時にも確認、Issue #114 silent
+#      fallback (2.4.1) を build pipeline で検出可能に
+# ============================================================
+RUN echo "=== Stage 0: base image PyTorch + sm_100 cubin verify ===" \
+ && python -c "\
+import torch, sys; \
+print(f'PT: {torch.__version__}'); \
+print(f'CUDA: {torch.version.cuda}'); \
+assert torch.__version__.startswith('2.8'), f'BLOCKED: expected PT 2.8.x, got {torch.__version__}'; \
+assert '12.8' in torch.version.cuda, f'BLOCKED: expected CUDA 12.8.x, got {torch.version.cuda}'; \
+print('OK: PT 2.8 + CUDA 12.8 confirmed (Issue #114 trap not present)')\
+" \
+ && TORCH_DIR=$(python -c 'import torch, os; print(os.path.dirname(torch.__file__))') \
+ # Note: `grep` reads to EOF (not `-q`) to avoid SIGPIPE under `set -o pipefail`
+ && cuobjdump --list-elf "$TORCH_DIR/lib/libtorch_cuda.so" 2>/dev/null | grep "sm_100" > /dev/null \
+ && echo "OK: libtorch_cuda.so contains sm_100 cubin" \
+ || (echo "FAIL: sm_100 cubin missing in base image"; exit 1)
+
+# ============================================================
+# Stage 1: 追加 system パッケージ (RunPod base に無い OpenCV/X libs 等)
+# Note: RunPod base には python3.11 / pip / ninja / git / build tools / cuda toolkit が
+#       既に入っているので、不足分のみを追加
+# ============================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender-dev \
+        libgl1-mesa-glx \
+        libgeos-dev \
+        libfontconfig1 \
+        libxi6 \
+        ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+# ============================================================
+# Stage 1.5: pip 全体に numpy/numba 上限制約 (v4 から維持)
+# Why: nuscenes-devkit / scikit-image 等が numpy 2.x へ silently upgrade することを予防
+# 動作: PIP_CONSTRAINT が設定されると、以降の全 pip install が constraint を尊重
+# ============================================================
+RUN mkdir -p /etc/pip \
+ && echo "numpy==1.26.4" >> /etc/pip/constraints.txt \
+ && echo "numba==0.58.1" >> /etc/pip/constraints.txt \
+ && cat /etc/pip/constraints.txt
+ENV PIP_CONSTRAINT=/etc/pip/constraints.txt
+
+# setuptools の固定 (mmdet3d 0.17.1 setup.py 互換のため、v4 で実績 59.5.0)
+# Note: Python 3.11 でも setuptools 59.5.0 は動作するが、distutils deprecation 警告が出る
+RUN python -m pip install --no-cache-dir --upgrade pip \
+ && python -m pip install --no-cache-dir "setuptools==59.5.0" wheel
+
+# ============================================================
+# Stage 2: 環境確認 (Python 3.11 で distutils が import 可能か含む)
+# ============================================================
+RUN echo "=== Stage 2: environment verification ===" \
+ && python --version \
+ && which python python3 pip \
+ && nvcc --version \
+ && python -c "\
+import sys, distutils; \
+print(f'sys.executable: {sys.executable}'); \
+print(f'sys.version: {sys.version}'); \
+print(f'distutils: {distutils.__file__}'); \
+assert sys.version_info[:2] == (3, 11), f'expected Python 3.11, got {sys.version_info[:2]}'; \
+print('OK: Python 3.11 + distutils available')\
+"
+
+# ============================================================
+# Stage 3 (削除): PyTorch self-install
+#   v4 では Stage 3a/3b で pip install torch==2.7.0+cu128 + cuobjdump check していた
+#   v5 では base 同梱の 2.8.0.dev+cu128 を Stage 0 で verify 済 → self-install 不要
+# ============================================================
+
+# ============================================================
+# Stage 4: pip dry-run で torch 非更新を JSON parse 厳密検証
+# Why: 後続の mmcv install で torch family が依存解決で上書きされないことを確認
+# Note: v4 同様、`--no-build-isolation` を渡すことで pip が build 時に setup_requires を
+#       触らないようにする
+# ============================================================
+RUN echo "=== Stage 4: Pre-flight check — pip will NOT touch torch family ===" \
+ && pip install --dry-run --report /tmp/dryrun_mmcv.json \
+        --no-build-isolation "mmcv-full==1.7.2" 2>&1 | tail -20 \
+ && python -c "\
+import json, sys; \
+data = json.load(open('/tmp/dryrun_mmcv.json')); \
+forbidden = {'torch', 'torchvision', 'torchaudio', 'triton'}; \
+to_install = [i['metadata']['name'] for i in data.get('install', [])]; \
+hit = forbidden & set(to_install); \
+sys.exit(f'BLOCKED: pip wants to (re)install: {hit}') if hit else print('OK: torch family untouched. Will install:', to_install)\
+"
+
+# ============================================================
+# Stage 5: mmcv-full==1.7.2 ソースビルド (sm_90 + sm_100 cubin 生成)
+# Why: 公式 prebuilt wheel は sm_100 を含まない (cu118/torch2.0 ライン)
+#      → source build で TORCH_CUDA_ARCH_LIST="9.0;10.0" を反映
+# Risk: mmcv 1.7.2 setup.py の Python 3.11 互換性は実機検証なし
+#       (PyPI には py3.11 wheel 無し、source build なら通る可能性高い)
+# 想定 build 時間: ~15-20 min (MAX_JOBS=8, nvcc 12.8)
+# ============================================================
+RUN echo "=== Stage 5: mmcv-full 1.7.2 sourcebuild for sm_90/sm_100 (Python 3.11) ===" \
+ && pip install --no-cache-dir --no-build-isolation --no-binary mmcv-full -v \
+        mmcv-full==1.7.2 2>&1 | tee /tmp/mmcv_build.log | tail -100 \
+ && python -c "import mmcv; print(f'mmcv: {mmcv.__version__}')" \
+ && rm -rf /root/.cache/pip
+
+# ============================================================
+# Stage 6: mmcv._ext smoke check (cubin + シンボル両方確認)
+# 追加 in v5: MultiScaleDeformableAttention シンボル存在確認 (user 要件)
+# ============================================================
+RUN echo "=== Stage 6: mmcv._ext cubin + symbol verification ===" \
+ && MMCV_EXT_SO=$(python -c 'import mmcv._ext; print(mmcv._ext.__file__)') \
+ && echo "mmcv._ext: $MMCV_EXT_SO" \
+ && > /tmp/cubin_mmcv.log \
+ && cuobjdump --list-elf "$MMCV_EXT_SO" 2>/dev/null | tee /tmp/cubin_mmcv.log \
+ && grep -q "sm_100" /tmp/cubin_mmcv.log \
+ && echo "OK: sm_100 cubin present in mmcv._ext" \
+ || (echo "FAIL: sm_100 cubin missing in mmcv._ext"; cat /tmp/cubin_mmcv.log; exit 1)
+
+# Stage 6b: MultiScaleDeformableAttention シンボル確認 (v5 追加、BEVFormer 中核演算)
+# Note: ext_loader.load_ext('_ext', [...]) で fetch される関数名を直接 import 確認
+RUN echo "=== Stage 6b: mmcv._ext.ms_deform_attn symbol check ===" \
+ && python -c "\
+from mmcv.utils import ext_loader; \
+ext = ext_loader.load_ext('_ext', ['ms_deform_attn_forward', 'ms_deform_attn_backward']); \
+assert hasattr(ext, 'ms_deform_attn_forward'), 'ms_deform_attn_forward missing'; \
+assert hasattr(ext, 'ms_deform_attn_backward'), 'ms_deform_attn_backward missing'; \
+print('OK: MultiScaleDeformableAttention forward/backward symbols present')\
+"
+
+# ============================================================
+# Stage 7: mmdet + mmsegmentation (mmcv 1.7.2 互換版、v4 と同じ pin)
+# Note: 公式 wheel に Python 3.11 用が存在しなければ source build に fallback
+# ============================================================
+RUN echo "=== Stage 7: mmdet + mmseg ===" \
+ && pip install --no-cache-dir -v \
+        "mmdet==2.28.2" \
+        "mmsegmentation==0.30.0" 2>&1 | tail -50 \
+ && python -c "\
+import mmdet, mmseg; \
+print(f'mmdet: {mmdet.__version__}'); \
+print(f'mmseg: {mmseg.__version__}')\
+" \
+ && rm -rf /root/.cache/pip
+
+# ============================================================
+# Stage 7.6: mmdet3d build/runtime deps を事前 install (v4 と同じ pin)
+# Why: mmdet3d 0.17.1 setup.py の install_requires は古い (numpy<1.20, numba==0.48)
+#      → Stage 8b で --no-deps を使う前提で、必要な runtime deps を現代版で先に install
+# ============================================================
+RUN echo "=== Stage 7.6: pre-install build/runtime deps for mmdet3d ===" \
+ && pip install --no-cache-dir -v \
+        "Cython==3.2.4" \
+        "numba==0.58.1" \
+        "scikit-image==0.19.3" \
+        "networkx==2.8.8" \
+        "lyft-dataset-sdk==0.0.8" 2>&1 | tail -30 \
+ && python -c "\
+import numba, skimage, networkx; \
+print(f'numba: {numba.__version__}'); \
+print(f'scikit-image: {skimage.__version__}'); \
+print(f'networkx: {networkx.__version__}')\
+"
+
+# ============================================================
+# Stage 7.7: numpy/numba version verify (Python 3.11 で 1.26.4 / 0.58.1 確認)
+# ============================================================
+RUN echo "=== Stage 7.7: numpy/numba version verify (Python 3.11) ===" \
+ && python -c "\
+import numpy, numba; \
+print(f'numpy: {numpy.__version__}'); \
+print(f'numba: {numba.__version__}'); \
+v_np = tuple(int(x) for x in numpy.__version__.split('.')[:2]); \
+v_nb = tuple(int(x) for x in numba.__version__.split('.')[:2]); \
+assert v_np < (2, 0), f'numpy must be < 2.0, got {numpy.__version__}'; \
+assert v_nb == (0, 58), f'numba must be 0.58.x, got {numba.__version__}'; \
+print('OK: numpy < 2.0 and numba 0.58.x confirmed'); \
+from numpy.distutils.misc_util import Configuration; \
+print('OK: numpy.distutils available')\
+"
+
+# ============================================================
+# Stage 8a: mmdet3d v0.17.1 clone + 14 patches 適用 (v4 と同じ)
+# Patches: 01-08 (mmdet3d THC/data_ptr/numba/spconv/visualizer) + 13 (spconv C++17)
+#          09-12 + 15 (BEVFormer dd3d/init guards/tkinter)
+# ============================================================
+COPY src/patches /tmp/patches
+RUN echo "=== Stage 8a: mmdet3d clone + apply patches 1-8 + 13 ===" \
+ && cd /tmp \
+ && git clone https://github.com/open-mmlab/mmdetection3d.git \
+ && cd mmdetection3d \
+ && git checkout v0.17.1 \
+ && bash /tmp/patches/mmdet3d/01_thc_header_replace.sh /tmp/mmdetection3d \
+ && bash /tmp/patches/mmdet3d/02_thc_header_delete.sh /tmp/mmdetection3d \
+ && bash /tmp/patches/mmdet3d/03_extern_thcstate_delete.sh /tmp/mmdetection3d \
+ && bash /tmp/patches/mmdet3d/04_data_to_data_ptr.sh /tmp/mmdetection3d \
+ && bash /tmp/patches/mmdet3d/05_mmcv_version_relax.sh /tmp/mmdetection3d \
+ && bash /tmp/patches/mmdet3d/06_numba_errors_path.sh /tmp/mmdetection3d \
+ && bash /tmp/patches/mmdet3d/07_spconv_force_register.sh /tmp/mmdetection3d \
+ && python /tmp/patches/mmdet3d/08_visualizer_import_guard.py /tmp/mmdetection3d \
+ && bash /tmp/patches/mmdet3d/13_spconv_cxx17.sh /tmp/mmdetection3d \
+ && echo "=== Verifying: no remaining THC references ===" \
+ && ! grep -rn "THC/THC.h\|THCState\|THCudaCheck" mmdet3d/ops/ \
+ && echo "OK: no THC references remain after patches 1-3"
+
+# ============================================================
+# Stage 8b: mmdet3d ビルド + ソースを /opt に保持 (v4 と同じ)
+# Why: `-e .` (editable mode) は PEP 660 非対応で失敗 → 通常 `pip install .`
+# Risk: mmdet3d 0.17.1 の 11 CUDA 拡張が Python 3.11 + PT 2.8 でビルド通るか
+# ============================================================
+RUN echo "=== Stage 8b: mmdet3d sourcebuild (Python 3.11 + PT 2.8) ===" \
+ && cd /tmp/mmdetection3d \
+ && pip install --no-cache-dir --no-build-isolation --no-deps -v . 2>&1 | tee /tmp/mmdet3d_build.log | tail -80 \
+ && cd / \
+ && python -c "\
+import mmdet3d; \
+print(f'mmdet3d installed: {mmdet3d.__version__} at {mmdet3d.__file__}'); \
+assert '/dist-packages/' in mmdet3d.__file__ or '/site-packages/' in mmdet3d.__file__, \
+    f'mmdet3d not in site-packages, only source path: {mmdet3d.__file__}'\
+" \
+ && mkdir -p /opt/mmdetection3d \
+ && cp -r /tmp/mmdetection3d/. /opt/mmdetection3d/ \
+ && rm -rf /tmp/mmdetection3d /root/.cache/pip
+
+# ============================================================
+# Stage 9: その他依存 (v4 = Py3.10 基準。pandas は Py3.11 対応 1.5.3 に bump)
+# ============================================================
+RUN pip install --no-cache-dir -v \
+        "einops==0.8.2" \
+        "fvcore==0.1.5.post20221221" \
+        seaborn \
+        "iopath==0.1.9" \
+        "timm==0.6.13" \
+        "matplotlib==3.5.2" \
+        "pandas==1.5.3" \
+        "scikit-image==0.19.3" \
+        "networkx==2.8.8" \
+        "trimesh" \
+        "nuscenes-devkit==1.1.10" \
+ && rm -rf /root/.cache/pip
+
+# ============================================================
+# Stage 9.5: nuscenes-devkit dict_keys 修正 (Python 3.11 でも同じ問題発生想定)
+# ============================================================
+RUN echo "=== Stage 9.5: nuscenes-devkit dict_keys patch ===" \
+ && bash /tmp/patches/misc/nuscenes_dict_keys.sh
+
+# ============================================================
+# Stage 10a: BEVFormer ソースコピー
+# ============================================================
+COPY src/ /workspace/bevformer/
+ENV PYTHONPATH=/workspace/bevformer:${PYTHONPATH:-}
+
+# ============================================================
+# Stage 10b: BEVFormer plugin パッチ 09-12 + 15 (v4 と同じ)
+# Note: patches 13/14 (custom_fwd 移行) は v4 同様削除 (FutureWarning 止まりで動作)
+# ============================================================
+RUN echo "=== Stage 10b: BEVFormer plugin patches 9-12 + 15 ===" \
+ && bash /tmp/patches/bevformer/09_dd3d_init_empty.sh /workspace/bevformer \
+ && bash /tmp/patches/bevformer/10_datasets_init_guard.sh /workspace/bevformer \
+ && bash /tmp/patches/bevformer/11_pipelines_init_guard.sh /workspace/bevformer \
+ && bash /tmp/patches/bevformer/12_plugin_init_guard.sh /workspace/bevformer \
+ && bash /tmp/patches/bevformer/15_remove_tkinter_typo.sh /workspace/bevformer
+
+# ============================================================
+# Stage 10.5: opencv-python → opencv-python-headless 切替 (v4 と同じ pin)
+# ============================================================
+RUN pip uninstall -y opencv-python 2>/dev/null || true \
+ && pip install --no-cache-dir "opencv-python-headless==4.11.0.86" \
+ && rm -rf /root/.cache/pip
+
+# ============================================================
+# Stage 10c: 全 .so に対する cubin 再検証 (v4 と同じ)
+# ============================================================
+RUN echo "=== Stage 10c: cubin verification on ALL .so files ===" \
+ && > /tmp/cubin_all.log \
+ && for so in \
+        $(python -c 'import mmcv._ext; print(mmcv._ext.__file__)') \
+        $(find /workspace/bevformer -name '*.so' 2>/dev/null) \
+        $(find /opt/mmdetection3d -name '*.so' 2>/dev/null); do \
+        echo "=== $so ===" | tee -a /tmp/cubin_all.log; \
+        cuobjdump --list-elf "$so" 2>/dev/null | tee -a /tmp/cubin_all.log; \
+    done \
+ && grep -q "sm_100" /tmp/cubin_all.log \
+ && echo "OK: sm_100 present in at least one .so" \
+ || (echo "FAIL: sm_100 cubin missing in all .so files"; cat /tmp/cubin_all.log; exit 1)
+
+# ============================================================
+# Stage 10.6: numpy/numba version drift 最終検出 (v4 と同じ)
+# ============================================================
+RUN echo "=== Stage 10.6: final numpy/numba drift check ===" \
+ && python -c "\
+import numpy, numba; \
+print(f'numpy: {numpy.__version__}'); \
+print(f'numba: {numba.__version__}'); \
+v_np = tuple(int(x) for x in numpy.__version__.split('.')[:2]); \
+assert v_np < (2, 0), f'DRIFT: numpy moved to {numpy.__version__} during build'; \
+print('OK: no numpy drift detected')\
+"
+
+# ============================================================
+# Stage 11: 最終検証 — torch 非変動 + 全 import 成功
+# ============================================================
+RUN echo "=== Stage 11: final verification ===" \
+ && python -c "\
+import torch; \
+assert torch.__version__.startswith('2.8'), f'torch reverted during build: {torch.__version__}'; \
+print(f'OK: torch={torch.__version__} cuda={torch.version.cuda}')\
+" \
+ && python -c "\
+import sys; print(f'Python: {sys.version}'); \
+import mmcv; print(f'mmcv: {mmcv.__version__}'); \
+import mmdet; print(f'mmdet: {mmdet.__version__}'); \
+import mmseg; print(f'mmseg: {mmseg.__version__}'); \
+import mmdet3d; print(f'mmdet3d: {mmdet3d.__version__}'); \
+import numpy; print(f'numpy: {numpy.__version__}'); \
+import numba; print(f'numba: {numba.__version__}'); \
+from nuscenes import NuScenes; print('nuscenes-devkit: OK'); \
+import projects.mmdet3d_plugin; print('BEVFormer plugin: OK')\
+"
+
+# ============================================================
+# Stage 12: クリーンアップ
+# ============================================================
+RUN pip cache purge 2>/dev/null || true \
+ && rm -rf /root/.cache/pip /tmp/mmcv_build.log /tmp/mmdet3d_build.log \
+        /tmp/dryrun_mmcv.json /tmp/cubin_*.log /tmp/patches
+
+WORKDIR /workspace/bevformer
+
+# CMD / ENTRYPOINT は明示しない → base の /start.sh (nginx + sleep infinity) を継承
+# これにより RunPod Pod 上で container が即 exit せず、SSH 注入を受け入れる

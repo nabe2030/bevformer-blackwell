@@ -1,0 +1,142 @@
+# Dockerfile.blackwell-runpod-v6-release
+# Strategy C1 release image: v6 (SimpleDDP + Strategy C1 patches) + Phase 4
+# release artifacts baked (run_amp_benchmark.sh, tensor_core_ratio.py,
+# torch_profiler_hook.py, bevformer_tiny_profile.py).
+#
+# Built FROM v5 directly (NOT from v6) — duplicates v6 stages so that release
+# image is a single self-contained layer chain that can be tagged
+# `nabe2030/bevformer:blackwell-pt2.8` without depending on the v6 tag.
+#
+# Build (u58-slurm, CPU only, ~5 min, mostly cache from v6 build):
+#   cd ~/work/bevformer
+#   docker build --provenance=false --sbom=false --progress=plain \
+#     -t nabe2030/bevformer:blackwell-pt2.8 \
+#     -f src/Dockerfile.blackwell-runpod-v6-release .
+#
+# Push: --provenance=false --sbom=false MANDATORY (CLAUDE.md OCI Index trap rule).
+# Verify post-push: docker manifest inspect ... → mediaType must be
+#   application/vnd.docker.distribution.manifest.v2+json (NOT OCI index).
+
+FROM nabe2030/bevformer:blackwell-base
+
+LABEL maintainer="nabe@gridtech.jp"
+LABEL strategy="C1-SimpleDDP-PT2x"
+LABEL release="blackwell-pt2.8"
+LABEL build_date="2026-05-21"
+
+# ============================================================
+# Stage v6-1: pip install morning-missing deps (tensorboard, future)
+# ============================================================
+RUN echo "=== v6-1: pip install tensorboard future ===" \
+ && pip install --no-cache-dir tensorboard future 2>&1 | tail -3 \
+ && python -c "from torch.utils.tensorboard import SummaryWriter; print('tensorboard OK')"
+
+# ============================================================
+# Stage v6-2: numpy 1.26.4 compat (np.bool deprecated/removed)
+# ============================================================
+RUN echo "=== v6-2: mmdet3d np.bool → bool ===" \
+ && find /usr/local/lib/python3.11/dist-packages/mmdet3d/ -name '*.py' -exec grep -l 'np\.bool[^_]' {} \; 2>/dev/null \
+  | xargs -r sed -i -E 's/np\.bool([^_]|$)/bool\1/g' \
+ && echo "patched files (none = OK):" \
+ && grep -rln 'np\.bool[^_]' /usr/local/lib/python3.11/dist-packages/mmdet3d/ 2>/dev/null | head -5 || true
+
+# ============================================================
+# Stage v6-3: tools/train.py --local-rank/--local_rank alias (PT 2.x compat)
+# ============================================================
+RUN echo "=== v6-3: tools/train.py local_rank alias ===" \
+ && sed -i "s|'--local_rank',|'--local_rank', '--local-rank', dest='local_rank',|" \
+    /workspace/bevformer/tools/train.py \
+ && grep -n 'local_rank' /workspace/bevformer/tools/train.py | head -3
+
+# ============================================================
+# Stage v6-4: mmcv parallel/_functions.py — int → torch.device wrap (PT 2.x)
+# ============================================================
+RUN echo "=== v6-4: mmcv parallel _functions.py torch.device wrap ===" \
+ && F=/usr/local/lib/python3.11/dist-packages/mmcv/parallel/_functions.py \
+ && sed -i 's|streams = \[_get_stream(device) for device in target_gpus\]|import torch as _torch_mmcv_patch; streams = [_get_stream(_torch_mmcv_patch.device("cuda", d) if isinstance(d, int) else d) for d in target_gpus]|' "$F" \
+ && grep -n 'streams = \[_get_stream' "$F"
+
+# ============================================================
+# Stage v6-5: Strategy C1 patch 16 — mmcv MMDistributedDataParallel → SimpleDDP
+# ============================================================
+COPY patches/bevformer/16_simple_ddp_wrapper.sh /tmp/patches/c1/16_simple_ddp_wrapper.sh
+RUN echo "=== v6-5: Strategy C1 patch 16 (SimpleDDP wrapper) ===" \
+ && chmod +x /tmp/patches/c1/16_simple_ddp_wrapper.sh \
+ && bash /tmp/patches/c1/16_simple_ddp_wrapper.sh
+
+# ============================================================
+# Stage v6-6: Strategy C1 patch 17 — tools/test.py single-GPU support
+# ============================================================
+COPY patches/bevformer/17_test_py_single_gpu.sh /tmp/patches/c1/17_test_py_single_gpu.sh
+RUN echo "=== v6-6: Strategy C1 patch 17 (test.py single-GPU) ===" \
+ && chmod +x /tmp/patches/c1/17_test_py_single_gpu.sh \
+ && bash /tmp/patches/c1/17_test_py_single_gpu.sh /workspace/bevformer
+
+# ============================================================
+# Stage v6-7: copy BEVFormer source to /opt/bevformer (volume mount workaround)
+# ============================================================
+RUN echo "=== v6-7: cp /workspace/bevformer → /opt/bevformer (volume-mask resistant) ===" \
+ && mkdir -p /opt/bevformer \
+ && cp -r /workspace/bevformer/. /opt/bevformer/ \
+ && ls /opt/bevformer/ | head -10
+
+# Ensure PYTHONPATH includes /opt/bevformer for runtime
+ENV PYTHONPATH=/opt/bevformer:/workspace/bevformer:${PYTHONPATH:-}
+
+# ============================================================
+# Stage v6-8: Release artifacts bake
+#  - run_amp_benchmark.sh        → /opt/bevformer/scripts/
+#  - tensor_core_ratio.py        → /opt/bevformer/scripts/
+#  - torch_profiler_hook.py      → /opt/bevformer/projects/mmdet3d_plugin/bevformer/hooks/
+#  - bevformer_tiny_profile.py   → /opt/bevformer/projects/configs/bevformer/
+# These are Phase 4 hot-fixes promoted from per-Pod scp to image-level bake.
+# Source files are already placed in src/ before this build.
+# ============================================================
+COPY scripts/run_amp_benchmark.sh /opt/bevformer/scripts/run_amp_benchmark.sh
+COPY scripts/tensor_core_ratio.py      /opt/bevformer/scripts/tensor_core_ratio.py
+COPY hooks/torch_profiler_hook.py \
+     /opt/bevformer/projects/mmdet3d_plugin/bevformer/hooks/torch_profiler_hook.py
+COPY configs/bevformer/bevformer_tiny_profile.py \
+     /opt/bevformer/projects/configs/bevformer/bevformer_tiny_profile.py
+COPY configs/bevformer/bevformer_tiny_amp_fp32.py \
+     /opt/bevformer/projects/configs/bevformer/bevformer_tiny_amp_fp32.py
+COPY configs/bevformer/bevformer_tiny_amp_fp16.py \
+     /opt/bevformer/projects/configs/bevformer/bevformer_tiny_amp_fp16.py
+
+RUN echo "=== v6-8: register TorchProfilerHook + verify baked artifacts ===" \
+ && printf 'from .custom_hooks import TransferWeight\nfrom .torch_profiler_hook import TorchProfilerHook\n' \
+    > /opt/bevformer/projects/mmdet3d_plugin/bevformer/hooks/__init__.py \
+ && chmod +x /opt/bevformer/scripts/run_amp_benchmark.sh \
+ && cat /opt/bevformer/projects/mmdet3d_plugin/bevformer/hooks/__init__.py \
+ && python3 -c "import sys; sys.path.insert(0, '/opt/bevformer'); from projects.mmdet3d_plugin.bevformer.hooks import TransferWeight, TorchProfilerHook; print('hooks OK')" \
+ && ls -la /opt/bevformer/scripts/run_amp_benchmark.sh \
+           /opt/bevformer/scripts/tensor_core_ratio.py \
+           /opt/bevformer/projects/configs/bevformer/bevformer_tiny_profile.py \
+           /opt/bevformer/projects/configs/bevformer/bevformer_tiny_amp_fp32.py \
+           /opt/bevformer/projects/configs/bevformer/bevformer_tiny_amp_fp16.py \
+           /opt/bevformer/projects/mmdet3d_plugin/bevformer/hooks/torch_profiler_hook.py \
+ && python3 /opt/bevformer/scripts/tensor_core_ratio.py 2>&1 | head -5 || true \
+ && python3 -c "import sys; sys.path.insert(0,'/opt/bevformer'); from mmcv import Config; \
+    cfg32 = Config.fromfile('/opt/bevformer/projects/configs/bevformer/bevformer_tiny_amp_fp32.py'); \
+    cfg16 = Config.fromfile('/opt/bevformer/projects/configs/bevformer/bevformer_tiny_amp_fp16.py'); \
+    print(f'amp_fp32 OK: model.type={cfg32.model.type}, fp16 key={\"fp16\" in cfg32}'); \
+    print(f'amp_fp16 OK: model.type={cfg16.model.type}, fp16 loss_scale={cfg16.fp16.loss_scale}')" \
+ && grep -E '^CONFIG_ROOT=|^DATA_ROOT=|^TRAIN_PY=|^DIST_TRAIN_SH=' /opt/bevformer/scripts/run_amp_benchmark.sh \
+ && grep -E '^[[:space:]]*pushd /workspace|^[[:space:]]*popd >' /opt/bevformer/scripts/run_amp_benchmark.sh \
+ && echo "OK: v6-8 release artifacts baked (amp configs + script paths verified)"
+
+# ============================================================
+# Stage v6-9: final verify (in-container smoke)
+# ============================================================
+RUN echo "=== v6-9: final smoke ===" \
+ && python -c "import torch; print(f'torch: {torch.__version__}'); print(f'cuda: {torch.version.cuda}'); print(f'arch list: {torch.cuda.get_arch_list()}')" \
+ && python -c "import mmcv, mmdet, mmdet3d, mmseg; print(f'mmcv: {mmcv.__version__}'); print(f'mmdet: {mmdet.__version__}'); print(f'mmseg: {mmseg.__version__}'); print(f'mmdet3d: {mmdet3d.__version__}')" \
+ && python -c "from mmcv.parallel import MMDistributedDataParallel; import inspect; src = inspect.getsource(MMDistributedDataParallel); assert 'scatter_kwargs(inputs, kwargs' in src, 'SimpleDDP v3 not detected'; print('SimpleDDP v3 verified')" \
+ && python -c "import sys; sys.path.insert(0, '/opt/bevformer'); import projects.mmdet3d_plugin; print('BEVFormer plugin: OK')" \
+ && echo "OK: release smoke all green"
+
+# Clean tmp patches
+RUN rm -rf /tmp/patches
+
+# WORKDIR + CMD inherited from v5 base (runpod /start.sh継承)
+WORKDIR /workspace/bevformer

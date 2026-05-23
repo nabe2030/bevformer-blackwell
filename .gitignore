@@ -1,0 +1,30 @@
+# data (re-downloadable, large)
+data/
+*.pth
+*.pkl
+
+# build artifacts
+*.so
+*.o
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+
+# profiler traces (large)
+*.pt.trace.json
+torch_profile/
+runs/
+
+# secrets — NEVER commit
+*.secret
+.secrets/
+*webhook*
+*token*
+*.pem
+*.key
+
+# editor / OS
+*.swp
+.DS_Store
